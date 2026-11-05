@@ -54,6 +54,8 @@ Open port `5173`. Vite forwards `/api` requests to FastAPI on port `8000`. The A
 
 Set `GROQ_API_KEY` in your local `.env` or environment to enable provider-powered tutor answers, summaries, and quizzes. Without a key, the existing local fallback behavior remains available. Do not commit credentials; `.env` is ignored by git.
 
+To make a one-off Groq connectivity check using the root `.env`, run `python test_groq.py`. It sends a short prompt to `llama-3.3-70b-versatile` and prints either the response or the provider error.
+
 ## Features
 
 - **Student accounts:** Register and log in with a private account; logout clears the session.

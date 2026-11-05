@@ -182,7 +182,11 @@ class MultiUserAuthTests(unittest.TestCase):
         self.assertEqual(plan.status_code, 200, plan.text)
         session_id = plan.json()["sessions"][0]["id"]
 
-        with patch.object(main.ai, "tutor_answer", side_effect=main.ai.AIConfigurationError()):
+        with patch.object(
+            main.ai,
+            "tutor_answer",
+            side_effect=main.ai.AIConfigurationError("Groq API key is not configured."),
+        ):
             tutor = self.request(
                 client_a,
                 "POST",
@@ -191,7 +195,11 @@ class MultiUserAuthTests(unittest.TestCase):
             )
         self.assertEqual(tutor.status_code, 200, tutor.text)
 
-        with patch.object(main.ai, "generate_quiz", side_effect=main.ai.AIConfigurationError()):
+        with patch.object(
+            main.ai,
+            "generate_quiz",
+            side_effect=main.ai.AIConfigurationError("Groq API key is not configured."),
+        ):
             quiz = self.request(
                 client_a,
                 "POST",
@@ -208,7 +216,11 @@ class MultiUserAuthTests(unittest.TestCase):
         self.assertEqual(score.status_code, 201, score.text)
         self.assertEqual(score.json()["total_questions"], 3)
 
-        with patch.object(main.ai, "summarize_text", side_effect=main.ai.AIConfigurationError()):
+        with patch.object(
+            main.ai,
+            "summarize_text",
+            side_effect=main.ai.AIConfigurationError("Groq API key is not configured."),
+        ):
             upload = self.request(
                 client_a,
                 "POST",
@@ -222,12 +234,17 @@ class MultiUserAuthTests(unittest.TestCase):
         self.assertEqual(own_file.status_code, 200)
         self.assertEqual(own_file.headers["content-type"], "application/pdf")
         self.assertEqual(own_file.content[:5], b"%PDF-")
-        quiz_from_notes = self.request(
-            client_a,
-            "POST",
-            "/api/quizzes/generate",
-            json={"material_id": material_id, "count": 3},
-        )
+        with patch.object(
+            main.ai,
+            "generate_quiz",
+            side_effect=main.ai.AIConfigurationError("Groq API key is not configured."),
+        ):
+            quiz_from_notes = self.request(
+                client_a,
+                "POST",
+                "/api/quizzes/generate",
+                json={"material_id": material_id, "count": 3},
+            )
         self.assertEqual(quiz_from_notes.status_code, 200, quiz_from_notes.text)
 
         dashboard_a = client_a.get("/api/dashboard").json()

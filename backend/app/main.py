@@ -483,7 +483,7 @@ def summarize(
     try:
         summaries = ai.summarize_text(extracted)
     except Exception as error:
-        logger.warning("Using local PDF summary fallback (%s, HTTP %s)", type(error).__name__, getattr(error, "status_code", "n/a"))
+        ai.log_groq_error(error)
         summaries = ai.fallback_summarize_text(extracted)
         powered_by_ai = False
     with connect() as db:
@@ -680,7 +680,7 @@ def quiz(
         questions = ai.generate_quiz(topic, payload.count, notes)
         powered_by_ai = True
     except Exception as error:
-        logger.warning("Using local quiz fallback (%s, HTTP %s)", type(error).__name__, getattr(error, "status_code", "n/a"))
+        ai.log_groq_error(error)
         questions = ai.fallback_generate_quiz(topic, payload.count, notes)
         powered_by_ai = False
     with connect() as db:

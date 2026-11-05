@@ -26,7 +26,7 @@ class AIProviderUnavailableError(RuntimeError):
 
 
 def _client():
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
     if not api_key:
         raise AIConfigurationError("Set GROQ_API_KEY to use Groq AI features.")
     from openai import OpenAI
@@ -39,7 +39,14 @@ def _client():
 
 
 def _model() -> str:
-    return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    return os.getenv("GROQ_MODEL") or "openai/gpt-oss-20b"
+
+
+def log_groq_error(error: Exception) -> None:
+    print(f"[AI Error] Groq call failed: {error}", flush=True)
+    status_code = getattr(error, "status_code", None)
+    if status_code is not None:
+        print(f"[AI Error] HTTP status code: {status_code}", flush=True)
 
 
 def _provider_unavailable(error: Exception) -> AIProviderUnavailableError | None:
@@ -238,8 +245,9 @@ def standalone_tutor_response(question: str, course: str) -> dict:
 
 
 def tutor_answer(question: str, course: str) -> str:
+    client = _client()
     try:
-        response = _client().chat.completions.create(
+        response = client.chat.completions.create(
             model=_model(),
             messages=[
                 {"role": "system", "content": f"You are a patient academic tutor for {course}. Give clear, detailed explanations with a worked example when useful. Explain why each step works and finish with one question that checks understanding. Use plain text and line breaks, not Markdown symbols."},
@@ -248,6 +256,7 @@ def tutor_answer(question: str, course: str) -> str:
             temperature=0.5,
         )
     except Exception as error:
+        log_groq_error(error)
         unavailable = _provider_unavailable(error)
         if unavailable:
             raise unavailable from None

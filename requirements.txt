@@ -7,3 +7,5 @@ rapidocr>=3.10,<4.0
 onnxruntime>=1.17,<2.0
 openai>=1.40
 python-dotenv>=1.0,<2.0
+werkzeug>=3.0,<4.0
+itsdangerous>=2.2,<3.0

@@ -1,3 +1,4 @@
+from contextlib import closing
 from io import BytesIO
 from pathlib import Path
 import sqlite3
@@ -36,7 +37,12 @@ class PdfOcrTests(unittest.TestCase):
         self.database.execute(
             "CREATE TABLE materials ("
             "id INTEGER PRIMARY KEY, filename TEXT, page_count INTEGER, text_content TEXT, "
-            "short_summary TEXT, detailed_summary TEXT, pdf_content BLOB)"
+            "short_summary TEXT, detailed_summary TEXT, pdf_content BLOB, user_id INTEGER)"
+        )
+        self.database.execute(
+            "CREATE TABLE study_history ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER, activity TEXT, "
+            "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
         self.database_context = patch("backend.app.main.connect", return_value=self.database)
         self.database_context.start()
@@ -57,7 +63,11 @@ class PdfOcrTests(unittest.TestCase):
         engine = Mock()
 
         with patch("backend.app.main._get_ocr_engine", return_value=engine):
-            result = main.summarize(UploadFile(filename="notes.pdf", file=BytesIO(content)))
+            result = main.summarize(
+                UploadFile(filename="notes.pdf", file=BytesIO(content)),
+                user_id=1,
+                _=None,
+            )
 
         engine.assert_not_called()
         self.assertEqual(result["pages"], 1)
@@ -78,7 +88,11 @@ class PdfOcrTests(unittest.TestCase):
         engine = Mock(return_value=SimpleNamespace(txts=[ocr_text]))
 
         with patch("backend.app.main._get_ocr_engine", return_value=engine):
-            result = main.summarize(UploadFile(filename="scan.pdf", file=BytesIO(content)))
+            result = main.summarize(
+                UploadFile(filename="scan.pdf", file=BytesIO(content)),
+                user_id=1,
+                _=None,
+            )
 
         engine.assert_called_once()
         self.assertEqual(self.summary_mock.call_args.args[0], ocr_text.strip())
@@ -94,7 +108,7 @@ class PdfOcrTests(unittest.TestCase):
     def test_existing_database_gains_summary_columns(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "study_agent.db"
-            with sqlite3.connect(path) as legacy_database:
+            with closing(sqlite3.connect(path)) as legacy_database, legacy_database:
                 legacy_database.execute(
                     "CREATE TABLE materials ("
                     "id INTEGER PRIMARY KEY, filename TEXT NOT NULL, page_count INTEGER NOT NULL, "
@@ -102,7 +116,7 @@ class PdfOcrTests(unittest.TestCase):
                 )
             with patch.object(database, "DB_PATH", path):
                 database.initialize_database()
-            with sqlite3.connect(path) as migrated_database:
+            with closing(sqlite3.connect(path)) as migrated_database, migrated_database:
                 columns = {
                     row[1]
                     for row in migrated_database.execute("PRAGMA table_info(materials)")

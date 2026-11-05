@@ -1,25 +1,42 @@
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from functools import lru_cache
+import hmac
 import logging
 import os
 from pathlib import Path
+import secrets
+import sqlite3
+import time
 from urllib.parse import quote
 
 import pymupdf
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from . import ai
 from .database import connect, initialize_database
-from .schemas import ExamCreate, PlannerRequest, QuizRequest, QuizScoreCreate, TaskCreate, TaskUpdate, TutorRequest
+from .schemas import (
+    ExamCreate,
+    LoginRequest,
+    PlannerRequest,
+    QuizRequest,
+    QuizScoreCreate,
+    RegisterRequest,
+    TaskCreate,
+    TaskUpdate,
+    TutorRequest,
+)
 
 logger = logging.getLogger(__name__)
 MAX_PDF_SIZE = 50 * 1024 * 1024
 MAX_PDF_PAGES = 200
 MIN_TEXT_LENGTH_FOR_OCR = 50
+SESSION_MAX_AGE = 12 * 60 * 60
 
 
 @lru_cache(maxsize=1)
@@ -74,6 +91,22 @@ if codespace_name and forwarding_domain:
     allowed_origins.append(f"https://{codespace_name}-5173.{forwarding_domain}")
 
 app = FastAPI(title="Intelligent Study Agent API", version="1.0.0", lifespan=lifespan)
+is_production = os.getenv("APP_ENV", "").lower() == "production" or os.getenv("RENDER") == "true"
+session_secret = os.getenv("SESSION_SECRET")
+if is_production and (not session_secret or len(session_secret) < 32):
+    raise RuntimeError("SESSION_SECRET must contain at least 32 characters in production.")
+if not session_secret:
+    session_secret = secrets.token_urlsafe(32)
+    logger.warning("SESSION_SECRET is not set; using an ephemeral development key.")
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=session_secret,
+    session_cookie="study_session",
+    max_age=SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=is_production,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -81,6 +114,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def disable_private_caching(request: Request, call_next):
+    response = await call_next(request)
+    if (
+        request.url.path.startswith("/api/")
+        or request.url.path == "/"
+        or not request.url.path.startswith("/assets/")
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
 
 FRONTEND_DIST = Path(
     os.getenv("FRONTEND_DIST_DIR", Path(__file__).resolve().parents[2] / "dist")
@@ -95,6 +143,38 @@ else:
 
 def _dict_rows(rows):
     return [dict(row) for row in rows]
+
+
+def authenticated_user_id(request: Request) -> int:
+    user_id = request.session.get("user_id")
+    session_id = request.session.get("session_id")
+    if not isinstance(user_id, int) or not isinstance(session_id, str):
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Please log in to continue.")
+    with connect() as db:
+        active_session = db.execute(
+            "SELECT 1 FROM auth_sessions "
+            "WHERE session_id = ? AND user_id = ? AND expires_at > ?",
+            (session_id, user_id, int(time.time())),
+        ).fetchone()
+    if active_session is None:
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Please log in to continue.")
+    return user_id
+
+
+def require_csrf(request: Request) -> None:
+    expected = request.session.get("csrf_token")
+    provided = request.headers.get("x-csrf-token", "")
+    if not isinstance(expected, str) or not provided or not hmac.compare_digest(expected, provided):
+        raise HTTPException(status_code=403, detail="Your session expired. Refresh the page and try again.")
+
+
+def _record_activity(db, user_id: int, activity: str) -> None:
+    db.execute(
+        "INSERT INTO study_history (user_id, activity) VALUES (?, ?)",
+        (user_id, activity[:240]),
+    )
 
 
 def _ai_failure(feature: str, error: Exception) -> HTTPException:
@@ -124,74 +204,253 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/dashboard")
-def dashboard():
+@app.get("/api/auth/csrf")
+def csrf_token(request: Request):
+    token = request.session.get("csrf_token")
+    if not isinstance(token, str):
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return {"csrf_token": token}
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(
+    payload: RegisterRequest,
+    _: None = Depends(require_csrf),
+):
+    password_hash = generate_password_hash(payload.password, method="scrypt")
+    try:
+        with connect() as db:
+            db.execute(
+                "INSERT INTO users (full_name, email, password_hash) VALUES (?, ?, ?)",
+                (payload.full_name, payload.email, password_hash),
+            )
+    except sqlite3.IntegrityError as error:
+        if "users.email" in str(error).lower() or "unique constraint" in str(error).lower():
+            raise HTTPException(status_code=409, detail="An account with that email already exists.") from error
+        raise
+    return {"message": "Your account has been created. Please log in."}
+
+
+@app.post("/api/auth/login")
+def login(
+    payload: LoginRequest,
+    request: Request,
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
-        tasks = _dict_rows(db.execute("SELECT * FROM tasks ORDER BY completed, due_date").fetchall())
-        exams = _dict_rows(db.execute("SELECT * FROM exams WHERE exam_date >= ? ORDER BY exam_date LIMIT 4", (date.today().isoformat(),)).fetchall())
-        scores = _dict_rows(db.execute("SELECT * FROM scores ORDER BY id DESC LIMIT 6").fetchall())
-        total_tasks = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        completed = db.execute("SELECT COUNT(*) FROM tasks WHERE completed = 1").fetchone()[0]
-        total_subjects = db.execute("SELECT COUNT(DISTINCT name) FROM subjects").fetchone()[0]
-    average_score = round(sum(item["score"] for item in scores) / len(scores)) if scores else 0
+        user = db.execute(
+            "SELECT id, full_name, email, password_hash FROM users WHERE email = ? COLLATE NOCASE",
+            (payload.email,),
+        ).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], payload.password):
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+
+    session_id = secrets.token_urlsafe(32)
+    with connect() as db:
+        db.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?", (int(time.time()),)
+        )
+        db.execute(
+            "INSERT INTO auth_sessions (session_id, user_id, expires_at) VALUES (?, ?, ?)",
+            (session_id, user["id"], int(time.time()) + SESSION_MAX_AGE),
+        )
+    request.session.clear()
+    request.session.update(
+        {
+            "user_id": user["id"],
+            "session_id": session_id,
+            "csrf_token": secrets.token_urlsafe(32),
+        }
+    )
+    return {
+        "user": {"id": user["id"], "full_name": user["full_name"], "email": user["email"]},
+        "csrf_token": request.session["csrf_token"],
+    }
+
+
+@app.get("/api/auth/me")
+def current_user(user_id: int = Depends(authenticated_user_id)):
+    with connect() as db:
+        user = db.execute(
+            "SELECT id, full_name, email, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Please log in to continue.")
+    return {"user": dict(user)}
+
+
+@app.post("/api/auth/logout")
+def logout(
+    request: Request,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
+    with connect() as db:
+        db.execute(
+            "DELETE FROM auth_sessions WHERE session_id = ? AND user_id = ?",
+            (request.session["session_id"], user_id),
+        )
+    request.session.clear()
+    return {"message": "You have been logged out."}
+
+
+@app.get("/api/dashboard")
+def dashboard(user_id: int = Depends(authenticated_user_id)):
+    with connect() as db:
+        tasks = _dict_rows(db.execute(
+            "SELECT id, title, due_date, category, completed FROM tasks "
+            "WHERE user_id = ? ORDER BY completed, due_date",
+            (user_id,),
+        ).fetchall())
+        exams = _dict_rows(db.execute(
+            "SELECT id, course, title, exam_date FROM exams "
+            "WHERE user_id = ? AND exam_date >= ? ORDER BY exam_date LIMIT 4",
+            (user_id, date.today().isoformat()),
+        ).fetchall())
+        scores = _dict_rows(db.execute(
+            "SELECT id, course, score, label, recorded_at, total_questions FROM scores "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 6",
+            (user_id,),
+        ).fetchall())
+        all_scores = db.execute(
+            "SELECT COUNT(*) AS total, AVG(score) AS average FROM scores WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        total_tasks = db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        completed = db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE user_id = ? AND completed = 1", (user_id,)
+        ).fetchone()[0]
+        total_subjects = db.execute(
+            "SELECT COUNT(*) FROM subjects WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        total_materials = db.execute(
+            "SELECT COUNT(*) FROM materials WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        chats = _dict_rows(db.execute(
+            "SELECT id, user_message, ai_response, created_at FROM ai_chat_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+            (user_id,),
+        ).fetchall())
+        activities = _dict_rows(db.execute(
+            "SELECT id, activity, created_at FROM study_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 6",
+            (user_id,),
+        ).fetchall())
     return {
         "tasks": tasks,
         "exams": exams,
         "scores": scores,
-        "stats": {"total_subjects": total_subjects, "tasks_completed": completed, "tasks_total": total_tasks, "average_score": average_score},
+        "recent_conversations": chats,
+        "study_activity": activities,
+        "stats": {
+            "total_subjects": total_subjects,
+            "tasks_completed": completed,
+            "tasks_total": total_tasks,
+            "average_score": round(all_scores["average"] or 0),
+            "quizzes_completed": all_scores["total"],
+            "total_materials": total_materials,
+        },
     }
 
 
 @app.post("/api/tasks", status_code=201)
-def create_task(payload: TaskCreate):
+def create_task(
+    payload: TaskCreate,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
         cursor = db.execute(
-            "INSERT INTO tasks (title, due_date, category) VALUES (?, ?, ?)",
-            (payload.title.strip(), payload.due_date, payload.category),
+            "INSERT INTO tasks (title, due_date, category, user_id) VALUES (?, ?, ?, ?)",
+            (payload.title.strip(), payload.due_date.isoformat(), payload.category, user_id),
         )
-        task = db.execute("SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        task = db.execute(
+            "SELECT id, title, due_date, category, completed FROM tasks WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        _record_activity(db, user_id, f"Added task: {payload.title.strip()}")
     return dict(task)
 
 
 @app.post("/api/exams", status_code=201)
-def create_exam(payload: ExamCreate):
+def create_exam(
+    payload: ExamCreate,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
         cursor = db.execute(
-            "INSERT INTO exams (course, title, exam_date) VALUES (?, ?, ?)",
-            (payload.course.strip(), payload.title.strip(), payload.exam_date.isoformat()),
+            "INSERT INTO exams (course, title, exam_date, user_id) VALUES (?, ?, ?, ?)",
+            (payload.course.strip(), payload.title.strip(), payload.exam_date.isoformat(), user_id),
         )
-        exam = db.execute("SELECT * FROM exams WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        exam = db.execute(
+            "SELECT id, course, title, exam_date FROM exams WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        _record_activity(db, user_id, f"Added exam: {payload.title.strip()}")
     return dict(exam)
 
 
 @app.patch("/api/tasks/{task_id}")
-def update_task(task_id: int, payload: TaskUpdate):
+def update_task(
+    task_id: int,
+    payload: TaskUpdate,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
-        cursor = db.execute("UPDATE tasks SET completed = ? WHERE id = ?", (int(payload.completed), task_id))
+        cursor = db.execute(
+            "UPDATE tasks SET completed = ? WHERE id = ? AND user_id = ?",
+            (int(payload.completed), task_id, user_id),
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Task not found")
-        task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        task = db.execute(
+            "SELECT id, title, due_date, category, completed FROM tasks "
+            "WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+        _record_activity(db, user_id, "Completed a study task" if payload.completed else "Reopened a study task")
     return dict(task)
 
 
 @app.post("/api/tutor")
-def tutor(payload: TutorRequest):
+def tutor(
+    payload: TutorRequest,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     try:
-        return {
+        result = {
             "answer": ai.tutor_answer(payload.question, payload.course),
             "key_takeaways": [],
             "powered_by_ai": True,
         }
     except ai.AIConfigurationError:
-        return ai.standalone_tutor_response(payload.question, payload.course)
+        result = ai.standalone_tutor_response(payload.question, payload.course)
     except ai.AIProviderUnavailableError as error:
-        return ai.fallback_tutor_response(payload.question, payload.course, error.reason)
+        result = ai.fallback_tutor_response(payload.question, payload.course, error.reason)
     except Exception as error:
         raise _ai_failure("Tutor request", error) from error
+    with connect() as db:
+        db.execute(
+            "INSERT INTO ai_chat_history (user_id, user_message, ai_response) VALUES (?, ?, ?)",
+            (user_id, payload.question, result["answer"]),
+        )
+        _record_activity(db, user_id, f"Asked the AI tutor about {payload.course}")
+    return result
 
 
 @app.post("/api/summarize")
-def summarize(file: UploadFile = File(...)):
+def summarize(
+    file: UploadFile = File(...),
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     if Path(file.filename or "").suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
     content = file.file.read(MAX_PDF_SIZE + 1)
@@ -230,8 +489,8 @@ def summarize(file: UploadFile = File(...)):
     with connect() as db:
         cursor = db.execute(
             "INSERT INTO materials "
-            "(filename, page_count, text_content, short_summary, detailed_summary, pdf_content) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(filename, page_count, text_content, short_summary, detailed_summary, pdf_content, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 file.filename or "study-notes.pdf",
                 pages,
@@ -239,28 +498,35 @@ def summarize(file: UploadFile = File(...)):
                 summaries["short_summary"],
                 summaries["detailed_summary"],
                 content,
+                user_id,
             ),
         )
         material_id = cursor.lastrowid
+        _record_activity(db, user_id, f"Uploaded study material: {file.filename or 'study-notes.pdf'}")
     return {"material_id": material_id, "filename": file.filename, "pages": pages, "powered_by_ai": powered_by_ai, **summaries}
 
 
 @app.get("/api/materials")
-def get_materials():
+def get_materials(user_id: int = Depends(authenticated_user_id)):
     with connect() as db:
         materials = _dict_rows(db.execute(
             "SELECT id, filename, page_count, created_at, pdf_content IS NOT NULL AS original_available "
-            "FROM materials ORDER BY id DESC"
+            "FROM materials WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
         ).fetchall())
     return {"materials": materials}
 
 
 @app.get("/api/materials/{material_id}/file")
-def get_material_file(material_id: int, download: bool = False):
+def get_material_file(
+    material_id: int,
+    download: bool = False,
+    user_id: int = Depends(authenticated_user_id),
+):
     with connect() as db:
         material = db.execute(
-            "SELECT filename, text_content, pdf_content FROM materials WHERE id = ?",
-            (material_id,),
+            "SELECT filename, text_content, pdf_content FROM materials WHERE id = ? AND user_id = ?",
+            (material_id, user_id),
         ).fetchone()
     if material is None:
         raise HTTPException(status_code=404, detail="Study material not found.")
@@ -280,23 +546,37 @@ def get_material_file(material_id: int, download: bool = False):
 
 
 @app.delete("/api/materials/{material_id}")
-def delete_material(material_id: int):
+def delete_material(
+    material_id: int,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
-        cursor = db.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+        cursor = db.execute(
+            "DELETE FROM materials WHERE id = ? AND user_id = ?", (material_id, user_id)
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Study material not found.")
+        _record_activity(db, user_id, "Deleted a study material")
     return {"deleted": material_id}
 
 
 @app.get("/api/subjects")
-def get_subjects():
+def get_subjects(user_id: int = Depends(authenticated_user_id)):
     with connect() as db:
-        subjects = [row["name"] for row in db.execute("SELECT name FROM subjects ORDER BY name COLLATE NOCASE").fetchall()]
+        subjects = [row["name"] for row in db.execute(
+            "SELECT name FROM subjects WHERE user_id = ? ORDER BY name COLLATE NOCASE",
+            (user_id,),
+        ).fetchall()]
     return {"subjects": subjects}
 
 
 @app.post("/api/planner/generate")
-def generate_planner(payload: PlannerRequest):
+def generate_planner(
+    payload: PlannerRequest,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     unique_subjects = {}
     for subject in payload.subjects:
         normalized = subject.strip()
@@ -321,41 +601,75 @@ def generate_planner(payload: PlannerRequest):
             "completed": 0,
         })
     with connect() as db:
-        db.execute("DELETE FROM subjects")
-        db.executemany("INSERT INTO subjects (name) VALUES (?)", ((subject,) for subject in subjects))
-        db.execute("DELETE FROM study_sessions")
+        db.execute("DELETE FROM subjects WHERE user_id = ?", (user_id,))
         db.executemany(
-            "INSERT INTO study_sessions (study_date, subject, activity, duration, completed) VALUES (:study_date, :subject, :activity, :duration, :completed)",
-            sessions,
+            "INSERT INTO subjects (name, user_id) VALUES (?, ?)",
+            ((subject, user_id) for subject in subjects),
         )
-        sessions = _dict_rows(db.execute("SELECT * FROM study_sessions ORDER BY study_date, id").fetchall())
+        db.execute("DELETE FROM study_sessions WHERE user_id = ?", (user_id,))
+        db.executemany(
+            "INSERT INTO study_sessions "
+            "(study_date, subject, activity, duration, completed, user_id) "
+            "VALUES (:study_date, :subject, :activity, :duration, :completed, :user_id)",
+            [dict(session, user_id=user_id) for session in sessions],
+        )
+        sessions = _dict_rows(db.execute(
+            "SELECT id, study_date, subject, activity, duration, completed "
+            "FROM study_sessions WHERE user_id = ? ORDER BY study_date, id",
+            (user_id,),
+        ).fetchall())
+        _record_activity(db, user_id, "Generated a weekly study plan")
     return {"sessions": sessions, "subjects": subjects, "exam_date": payload.exam_date}
 
 
 @app.get("/api/planner")
-def get_planner():
+def get_planner(user_id: int = Depends(authenticated_user_id)):
     with connect() as db:
-        sessions = _dict_rows(db.execute("SELECT * FROM study_sessions ORDER BY study_date, id").fetchall())
+        sessions = _dict_rows(db.execute(
+            "SELECT id, study_date, subject, activity, duration, completed "
+            "FROM study_sessions WHERE user_id = ? ORDER BY study_date, id",
+            (user_id,),
+        ).fetchall())
     return {"sessions": sessions}
 
 
 @app.patch("/api/planner/{session_id}")
-def update_study_session(session_id: int, payload: TaskUpdate):
+def update_study_session(
+    session_id: int,
+    payload: TaskUpdate,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     with connect() as db:
-        cursor = db.execute("UPDATE study_sessions SET completed = ? WHERE id = ?", (int(payload.completed), session_id))
+        cursor = db.execute(
+            "UPDATE study_sessions SET completed = ? WHERE id = ? AND user_id = ?",
+            (int(payload.completed), session_id, user_id),
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Study session not found")
-        session = db.execute("SELECT * FROM study_sessions WHERE id = ?", (session_id,)).fetchone()
+        session = db.execute(
+            "SELECT id, study_date, subject, activity, duration, completed "
+            "FROM study_sessions WHERE id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        _record_activity(db, user_id, "Completed a planned study session" if payload.completed else "Reopened a planned study session")
     return dict(session)
 
 
 @app.post("/api/quizzes/generate")
-def quiz(payload: QuizRequest):
+def quiz(
+    payload: QuizRequest,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     notes = None
     topic = payload.topic
     if payload.material_id is not None:
         with connect() as db:
-            material = db.execute("SELECT filename, text_content FROM materials WHERE id = ?", (payload.material_id,)).fetchone()
+            material = db.execute(
+                "SELECT filename, text_content FROM materials WHERE id = ? AND user_id = ?",
+                (payload.material_id, user_id),
+            ).fetchone()
         if material is None:
             raise HTTPException(status_code=404, detail="Uploaded study material not found. Upload the PDF again to continue.")
         notes = material["text_content"]
@@ -369,22 +683,56 @@ def quiz(payload: QuizRequest):
         logger.warning("Using local quiz fallback (%s, HTTP %s)", type(error).__name__, getattr(error, "status_code", "n/a"))
         questions = ai.fallback_generate_quiz(topic, payload.count, notes)
         powered_by_ai = False
+    with connect() as db:
+        _record_activity(db, user_id, f"Generated a practice quiz about {topic}")
     return {"topic": topic, "material_id": payload.material_id, "questions": questions, "powered_by_ai": powered_by_ai}
 
 
 @app.post("/api/quiz-scores", status_code=201)
-def save_quiz_score(payload: QuizScoreCreate):
+def save_quiz_score(
+    payload: QuizScoreCreate,
+    user_id: int = Depends(authenticated_user_id),
+    _: None = Depends(require_csrf),
+):
     if payload.correct > payload.total:
         raise HTTPException(status_code=422, detail="Correct answers cannot exceed the number of questions.")
     percentage = round(payload.correct * 100 / payload.total)
     label = f"Quiz result: {payload.correct}/{payload.total} correct"
     with connect() as db:
         cursor = db.execute(
-            "INSERT INTO scores (course, score, label) VALUES (?, ?, ?)",
-            (payload.topic, percentage, label),
+            "INSERT INTO scores (course, score, label, total_questions, user_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (payload.topic, percentage, label, payload.total, user_id),
         )
-        result = db.execute("SELECT * FROM scores WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        result = db.execute(
+            "SELECT id, course, score, label, recorded_at, total_questions FROM scores "
+            "WHERE id = ? AND user_id = ?",
+            (cursor.lastrowid, user_id),
+        ).fetchone()
+        _record_activity(db, user_id, f"Completed a {payload.topic} quiz with {percentage}%")
     return dict(result)
+
+
+@app.get("/api/chat-history")
+def get_chat_history(user_id: int = Depends(authenticated_user_id)):
+    with connect() as db:
+        conversations = _dict_rows(db.execute(
+            "SELECT id, user_message, ai_response, created_at FROM ai_chat_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 50",
+            (user_id,),
+        ).fetchall())
+    return {"conversations": list(reversed(conversations))}
+
+
+@app.get("/api/study-history")
+def get_study_history(user_id: int = Depends(authenticated_user_id)):
+    with connect() as db:
+        activities = _dict_rows(db.execute(
+            "SELECT id, activity, created_at FROM study_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 100",
+            (user_id,),
+        ).fetchall())
+    return {"activities": activities}
 
 
 @app.get("/", include_in_schema=False)

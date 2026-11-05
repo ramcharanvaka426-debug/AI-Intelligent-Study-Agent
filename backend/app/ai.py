@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 
 backend_env = Path(__file__).resolve().parents[1] / ".env"
 root_env = Path(__file__).resolve().parents[2] / ".env"
-load_dotenv(backend_env)
 load_dotenv(root_env)
+load_dotenv(backend_env)
 
 SUMMARY_CHUNK_CHARS = 16000
 SUMMARY_CONTEXT_CHARS = 16000
@@ -28,7 +28,7 @@ class AIProviderUnavailableError(RuntimeError):
 def _client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise AIConfigurationError("Set GROQ_API_KEY in backend/.env to use Groq AI features.")
+        raise AIConfigurationError("Set GROQ_API_KEY to use Groq AI features.")
     from openai import OpenAI
 
     return OpenAI(

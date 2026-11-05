@@ -1,29 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowDownRight, ArrowUpRight, BookOpen, CalendarDays, Check, CircleHelp,
   Clock3, Download, ExternalLink, FileText, GraduationCap, LayoutDashboard, Lightbulb,
-  ListChecks, LoaderCircle, Menu, Moon, Plus, Save, Send, Sparkles, Sun,
+  ListChecks, LoaderCircle, LogOut, Menu, Moon, Plus, Save, Send, Sparkles, Sun,
   Target, Trash2, Upload, X,
 } from 'lucide-react'
 
 const MAX_PDF_SIZE = 50 * 1024 * 1024
+let csrfToken = ''
+let csrfRefreshPromise = null
 
 const initialDashboard = {
-  tasks: [
-    { id: 'a', title: 'Review lecture notes', due_date: new Date().toISOString().slice(0, 10), category: 'Biology', completed: 0 },
-    { id: 'b', title: 'Finish problem set 4', due_date: new Date(Date.now() + 86400000).toISOString().slice(0, 10), category: 'Calculus', completed: 0 },
-    { id: 'c', title: 'Read chapter 8', due_date: new Date(Date.now() + 172800000).toISOString().slice(0, 10), category: 'History', completed: 0 },
-  ],
-  exams: [
-    { id: 1, course: 'Calculus II', title: 'Midterm examination', exam_date: new Date(Date.now() + 6 * 86400000).toISOString().slice(0, 10) },
-    { id: 2, course: 'Cell Biology', title: 'Unit assessment', exam_date: new Date(Date.now() + 12 * 86400000).toISOString().slice(0, 10) },
-  ],
-  scores: [
-    { id: 1, course: 'Biology', score: 88, label: 'Cell structure quiz' },
-    { id: 2, course: 'Calculus', score: 76, label: 'Integration set' },
-    { id: 3, course: 'History', score: 94, label: 'Source analysis' },
-  ],
-  stats: { total_subjects: 3, tasks_completed: 2, tasks_total: 8, average_score: 86 },
+  tasks: [], exams: [], scores: [], recent_conversations: [], study_activity: [],
+  stats: { total_subjects: 0, tasks_completed: 0, tasks_total: 0, average_score: 0, quizzes_completed: 0, total_materials: 0 },
 }
 
 const navItems = [
@@ -50,10 +39,38 @@ const tutorSubjects = [
 ]
 
 async function api(path, options = {}) {
-  const response = await fetch(`/api${path}`, options)
+  const method = (options.method || 'GET').toUpperCase()
+  const headers = new Headers(options.headers || {})
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    if (!csrfToken) await refreshCsrfToken()
+    headers.set('X-CSRF-Token', csrfToken)
+  }
+  const response = await fetch(`/api${path}`, { ...options, method, headers, credentials: 'same-origin', cache: 'no-store' })
   const result = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(result.detail || 'Something went wrong. Please try again.')
+  if (result.csrf_token) csrfToken = result.csrf_token
+  if (!response.ok) {
+    if (response.status === 401 && !['/auth/csrf', '/auth/register', '/auth/login'].includes(path)) {
+      window.dispatchEvent(new Event('studyroom:unauthorized'))
+    }
+    const detail = Array.isArray(result.detail)
+      ? result.detail.map((item) => item.msg).join(' ')
+      : result.detail
+    throw new Error(detail || 'Something went wrong. Please try again.')
+  }
   return result
+}
+
+function refreshCsrfToken() {
+  if (!csrfRefreshPromise) {
+    csrfRefreshPromise = fetch('/api/auth/csrf', { credentials: 'same-origin', cache: 'no-store' })
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({}))
+        if (!response.ok || !result.csrf_token) throw new Error(result.detail || 'Could not start a secure session.')
+        csrfToken = result.csrf_token
+      })
+      .finally(() => { csrfRefreshPromise = null })
+  }
+  return csrfRefreshPromise
 }
 
 function formatDate(value, options = { month: 'short', day: 'numeric' }) {
@@ -62,6 +79,10 @@ function formatDate(value, options = { month: 'short', day: 'numeric' }) {
 }
 
 function App() {
+  const authEpoch = useRef(0)
+  const [authUser, setAuthUser] = useState(null)
+  const [authStatus, setAuthStatus] = useState('loading')
+  const [authError, setAuthError] = useState('')
   const [view, setView] = useState('dashboard')
   const [theme, setTheme] = useState(() => localStorage.getItem('studyroom-theme') || 'light')
   const [dashboard, setDashboard] = useState(initialDashboard)
@@ -73,7 +94,7 @@ function App() {
   const [tutorQuestion, setTutorQuestion] = useState('')
   const [tutorCourse, setTutorCourse] = useState('General')
   const [tutorMessages, setTutorMessages] = useState([
-    { role: 'assistant', text: 'Hi Alex! What are you working through today? Share a question, a tricky concept, or even a first attempt.' },
+    { role: 'assistant', text: 'What are you working through today? Share a question, a tricky concept, or even a first attempt.' },
   ])
   const [tutorBusy, setTutorBusy] = useState(false)
   const [pdfBusy, setPdfBusy] = useState(false)
@@ -96,39 +117,159 @@ function App() {
   const [quizScoreBusy, setQuizScoreBusy] = useState(false)
 
   async function loadDashboard() {
+    const requestEpoch = authEpoch.current
     try {
       const data = await api('/dashboard')
-      setDashboard(data)
-      setConnectionError('')
+      if (requestEpoch === authEpoch.current) {
+        setDashboard(data)
+        setConnectionError('')
+      }
     } catch (error) {
-      setConnectionError(error.message === 'Failed to fetch' ? 'API is offline. Start the FastAPI server to sync your workspace.' : error.message)
+      if (requestEpoch === authEpoch.current) {
+        setConnectionError(error.message === 'Failed to fetch' ? 'API is offline. Start the FastAPI server to sync your workspace.' : error.message)
+      }
     }
   }
 
   async function loadMaterials() {
+    const requestEpoch = authEpoch.current
     try {
       const data = await api('/materials')
+      if (requestEpoch !== authEpoch.current) return
       setMaterials(data.materials)
       setQuizMaterialId((current) => current && data.materials.some((item) => String(item.id) === current)
         ? current
         : String(data.materials[0]?.id || ''))
       setConnectionError('')
     } catch (error) {
-      setConnectionError(error.message === 'Failed to fetch' ? 'Could not load your study library. Check that the API is running.' : error.message)
+      if (requestEpoch === authEpoch.current) {
+        setConnectionError(error.message === 'Failed to fetch' ? 'Could not load your study library. Check that the API is running.' : error.message)
+      }
     }
   }
 
   useEffect(() => {
+    let active = true
+    refreshCsrfToken()
+      .then(() => api('/auth/me'))
+      .then(({ user }) => {
+        if (active) {
+          setAuthUser(user)
+          setAuthStatus('authenticated')
+        }
+      })
+      .catch((error) => {
+        if (active) {
+          setAuthUser(null)
+          setAuthStatus('unauthenticated')
+          if (error.message !== 'Please log in to continue.') setAuthError(error.message)
+        }
+      })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return
+    const requestEpoch = authEpoch.current
     loadDashboard()
-    api('/planner').then((data) => setPlannerSessions(data.sessions)).catch(() => {})
-    api('/subjects').then((data) => setPlannerSubjects(data.subjects.join(', '))).catch((error) => setConnectionError(error.message))
+    api('/planner').then((data) => {
+      if (requestEpoch === authEpoch.current) setPlannerSessions(data.sessions)
+    }).catch((error) => {
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
+    })
+    api('/subjects').then((data) => {
+      if (requestEpoch === authEpoch.current) setPlannerSubjects(data.subjects.join(', '))
+    }).catch((error) => {
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
+    })
+    api('/chat-history').then(({ conversations }) => {
+      if (requestEpoch !== authEpoch.current) return
+      const history = conversations.flatMap((item) => [
+        { role: 'user', text: item.user_message },
+        { role: 'assistant', text: item.ai_response },
+      ])
+      setTutorMessages(history.length ? history : [{ role: 'assistant', text: `Welcome, ${authUser.full_name.split(' ')[0]}. What are you working through today?` }])
+    }).catch((error) => {
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
+    })
     loadMaterials()
+  }, [authStatus, authUser?.id])
+
+  useEffect(() => {
+    const expireSession = () => {
+      clearPrivateState()
+      csrfToken = ''
+      refreshCsrfToken().catch((error) => setAuthError(error.message))
+    }
+    window.addEventListener('studyroom:unauthorized', expireSession)
+    return () => window.removeEventListener('studyroom:unauthorized', expireSession)
   }, [])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     localStorage.setItem('studyroom-theme', theme)
   }, [theme])
+
+  async function handleAuthenticated(user) {
+    authEpoch.current += 1
+    setAuthUser(user)
+    setAuthError('')
+    setAuthStatus('authenticated')
+  }
+
+  async function logout() {
+    try {
+      await api('/auth/logout', { method: 'POST' })
+      csrfToken = ''
+      await refreshCsrfToken()
+      clearPrivateState()
+    } catch (error) {
+      setConnectionError(error.message)
+    }
+  }
+
+  function clearPrivateState() {
+    authEpoch.current += 1
+    setAuthUser(null)
+    setAuthStatus('unauthenticated')
+    setAuthError('')
+    setDashboard(initialDashboard)
+    setConnectionError('')
+    setMobileNavOpen(false)
+    setTasksExpanded(false)
+    setShowTaskForm(false)
+    setTaskDraft({ title: '', due_date: new Date().toISOString().slice(0, 10), category: 'Study' })
+    setTutorQuestion('')
+    setTutorCourse('General')
+    setMaterials([])
+    setPdfBusy(false)
+    setPlannerSessions([])
+    setPlannerSubjects('')
+    setPlannerHours(2)
+    setPlannerBusy(false)
+    setExamDraft({ course: '', title: '', exam_date: '' })
+    setSummary(null)
+    setSummaryView('short_summary')
+    setTutorMessages([])
+    setTutorBusy(false)
+    setQuizUseNotes(false)
+    setQuizMaterialId('')
+    setQuizTopic('Cell biology')
+    setQuizCount(5)
+    setQuiz(null)
+    setQuizBusy(false)
+    setQuizAnswers({})
+    setQuizScoreSaved(false)
+    setQuizScoreBusy(false)
+    setView('dashboard')
+  }
+
+  if (authStatus === 'loading') {
+    return <div className="auth-loading"><LoaderCircle size={25} className="spin" /> Preparing your private study space…</div>
+  }
+  if (authStatus !== 'authenticated') {
+    return <AuthPage onAuthenticated={handleAuthenticated} initialError={authError} />
+  }
 
   function navigate(nextView) {
     setView(nextView)
@@ -177,16 +318,20 @@ function App() {
     event.preventDefault()
     const question = tutorQuestion.trim()
     if (!question || tutorBusy) return
+    const requestEpoch = authEpoch.current
     setTutorMessages((messages) => [...messages, { role: 'user', text: question }])
     setTutorQuestion('')
     setTutorBusy(true)
     try {
       const result = await api('/tutor', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, course: tutorCourse }) })
+      if (requestEpoch !== authEpoch.current) return
       setTutorMessages((messages) => [...messages, { role: 'assistant', text: result.answer }])
     } catch (error) {
-      setTutorMessages((messages) => [...messages, { role: 'assistant', text: `I couldn't reach the tutor: ${error.message}` }])
+      if (requestEpoch === authEpoch.current) {
+        setTutorMessages((messages) => [...messages, { role: 'assistant', text: `I couldn't reach the tutor: ${error.message}` }])
+      }
     } finally {
-      setTutorBusy(false)
+      if (requestEpoch === authEpoch.current) setTutorBusy(false)
     }
   }
 
@@ -200,26 +345,30 @@ function App() {
     }
     const formData = new FormData()
     formData.append('file', file)
+    const requestEpoch = authEpoch.current
     setPdfBusy(true)
     setSummary(null)
     try {
       const uploaded = await api('/summarize', { method: 'POST', body: formData })
+      if (requestEpoch !== authEpoch.current) return
       setSummary(uploaded)
       setQuizMaterialId(String(uploaded.material_id))
       setQuizUseNotes(true)
       setSummaryView('short_summary')
       await loadMaterials()
     } catch (error) {
-      setConnectionError(error.message)
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
     } finally {
-      setPdfBusy(false)
+      if (requestEpoch === authEpoch.current) setPdfBusy(false)
       event.target.value = ''
     }
   }
 
   async function deleteMaterial(material) {
+    const requestEpoch = authEpoch.current
     try {
       await api(`/materials/${material.id}`, { method: 'DELETE' })
+      if (requestEpoch !== authEpoch.current) return
       const remaining = materials.filter((item) => item.id !== material.id)
       setMaterials(remaining)
       if (quizMaterialId === String(material.id)) setQuizMaterialId(String(remaining[0]?.id || ''))
@@ -227,25 +376,27 @@ function App() {
       if (summary?.material_id === material.id) setSummary(null)
       setConnectionError('')
     } catch (error) {
-      setConnectionError(error.message)
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
     }
   }
 
   async function generatePlanner(event) {
     event.preventDefault()
+    const requestEpoch = authEpoch.current
     setPlannerBusy(true)
     try {
       const result = await api('/planner/generate', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ subjects: plannerSubjects.split(',').map((subject) => subject.trim()).filter(Boolean), hours_per_day: Number(plannerHours), exam_date: examDraft.exam_date || null }),
       })
+      if (requestEpoch !== authEpoch.current) return
       setPlannerSessions(result.sessions)
       setPlannerSubjects(result.subjects.join(', '))
       await loadDashboard()
     } catch (error) {
-      setConnectionError(error.message)
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
     } finally {
-      setPlannerBusy(false)
+      if (requestEpoch === authEpoch.current) setPlannerBusy(false)
     }
   }
 
@@ -262,30 +413,34 @@ function App() {
 
   async function generateQuiz(event) {
     event.preventDefault()
+    const requestEpoch = authEpoch.current
     setQuizBusy(true)
     setQuizAnswers({})
     setQuizScoreSaved(false)
     try {
-      setQuiz(await api('/quizzes/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic: quizTopic.trim() || null, material_id: quizUseNotes ? Number(quizMaterialId) : null, count: Number(quizCount) }) }))
+      const result = await api('/quizzes/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic: quizTopic.trim() || null, material_id: quizUseNotes ? Number(quizMaterialId) : null, count: Number(quizCount) }) })
+      if (requestEpoch === authEpoch.current) setQuiz(result)
     } catch (error) {
-      setConnectionError(error.message)
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
     } finally {
-      setQuizBusy(false)
+      if (requestEpoch === authEpoch.current) setQuizBusy(false)
     }
   }
 
   async function saveQuizScore() {
     if (!quiz || quizScoreBusy || quizScoreSaved) return
+    const requestEpoch = authEpoch.current
     const correct = quiz.questions.reduce((total, question, index) => total + (quizAnswers[index] === question.answer ? 1 : 0), 0)
     setQuizScoreBusy(true)
     try {
       await api('/quiz-scores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic: quiz.topic, correct, total: quiz.questions.length }) })
+      if (requestEpoch !== authEpoch.current) return
       setQuizScoreSaved(true)
       loadDashboard()
     } catch (error) {
-      setConnectionError(error.message)
+      if (requestEpoch === authEpoch.current) setConnectionError(error.message)
     } finally {
-      setQuizScoreBusy(false)
+      if (requestEpoch === authEpoch.current) setQuizScoreBusy(false)
     }
   }
 
@@ -313,7 +468,7 @@ function App() {
             <div className="streak-icon"><Target size={18} /></div>
             <div><strong>{dashboard.stats?.tasks_completed || 0} tasks complete</strong><span>Across your study plan</span></div>
           </div>
-          <div className="profile-button"><span className="avatar">AS</span><span className="profile-copy"><strong>Alex Student</strong><small>My learning space</small></span></div>
+          <div className="profile-button"><span className="avatar">{authUser.full_name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()}</span><span className="profile-copy"><strong>{authUser.full_name}</strong><small>My learning space</small></span><button className="logout-button" onClick={logout} aria-label="Log out" title="Log out"><LogOut size={16} /></button></div>
         </div>
       </aside>
 
@@ -331,6 +486,7 @@ function App() {
           dashboard={dashboard} tasksExpanded={tasksExpanded} setTasksExpanded={setTasksExpanded}
           showTaskForm={showTaskForm} setShowTaskForm={setShowTaskForm} taskDraft={taskDraft}
           setTaskDraft={setTaskDraft} addTask={addTask} toggleTask={toggleTask} navigate={navigate}
+          studentName={authUser.full_name}
         />}
         {view === 'tutor' && <TutorView messages={tutorMessages} question={tutorQuestion} setQuestion={setTutorQuestion} course={tutorCourse} setCourse={setTutorCourse} busy={tutorBusy} onSubmit={askTutor} />}
         {view === 'library' && <LibraryView busy={pdfBusy} materials={materials} onDelete={deleteMaterial} summary={summary} summaryView={summaryView} setSummaryView={setSummaryView} onUpload={uploadPdf} />}
@@ -341,22 +497,115 @@ function App() {
   )
 }
 
+function AuthPage({ onAuthenticated, initialError }) {
+  const [mode, setMode] = useState('login')
+  const [fullName, setFullName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(initialError || '')
+  const [notice, setNotice] = useState('')
+
+  async function submit(event) {
+    event.preventDefault()
+    setError('')
+    setNotice('')
+    if (mode === 'register' && password !== confirmPassword) {
+      setError('Your passwords do not match.')
+      return
+    }
+    setBusy(true)
+    try {
+      if (mode === 'register') {
+        await api('/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ full_name: fullName, email, password, confirm_password: confirmPassword }),
+        })
+        setMode('login')
+        setPassword('')
+        setConfirmPassword('')
+        setNotice('Your account is ready. Log in to open your private study space.')
+      } else {
+        const { user } = await api('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        })
+        onAuthenticated(user)
+      }
+    } catch (submitError) {
+      setError(submitError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function changeMode(nextMode) {
+    setMode(nextMode)
+    setError('')
+    setNotice('')
+  }
+
+  return (
+    <main className="auth-page">
+      <section className="auth-card">
+        <a className="brand auth-brand" href="/" aria-label="Studyroom home">
+          <span className="brand-mark"><GraduationCap size={21} strokeWidth={2.2} /></span>
+          <span>studyroom<span className="brand-period">.</span></span>
+        </a>
+        <div className="auth-eyebrow">YOUR PERSONAL LEARNING SPACE</div>
+        <h1>{mode === 'login' ? 'Welcome back.' : 'Create your account.'}</h1>
+        <p className="auth-description">{mode === 'login' ? 'Log in to pick up where your learning left off.' : 'Build a study space that belongs to you.'}</p>
+        {error && <div className="auth-message error" role="alert">{error}</div>}
+        {notice && <div className="auth-message success" role="status">{notice}</div>}
+        <form className="auth-form" onSubmit={submit}>
+          {mode === 'register' && <label className="auth-label">Full name<input autoComplete="name" value={fullName} onChange={(event) => setFullName(event.target.value)} minLength={2} maxLength={100} required /></label>}
+          <label className="auth-label">Email address<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} maxLength={254} required /></label>
+          <label className="auth-label">Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={password} onChange={(event) => setPassword(event.target.value)} minLength={mode === 'register' ? 8 : undefined} maxLength={128} required /></label>
+          {mode === 'register' && <label className="auth-label">Confirm password<input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} maxLength={128} required /></label>}
+          <button className="primary-button auth-submit" type="submit" disabled={busy}>
+            {busy ? <LoaderCircle size={16} className="spin" /> : null}
+            {busy ? 'Please wait…' : mode === 'login' ? 'Log in to your account' : 'Create account'}
+          </button>
+        </form>
+        <p className="auth-switch">
+          {mode === 'login' ? "New to Studyroom?" : 'Already have an account?'}
+          <button type="button" onClick={() => changeMode(mode === 'login' ? 'register' : 'login')}>
+            {mode === 'login' ? 'Create an account' : 'Log in'}
+          </button>
+        </p>
+        <div className="auth-privacy"><span className="live-dot" />Your conversations, notes, and progress stay in your account.</div>
+      </section>
+      <aside className="auth-art" aria-hidden="true">
+        <div className="auth-art-orbit orbit-a" /><div className="auth-art-orbit orbit-b" />
+        <span className="auth-art-spark">✦</span>
+        <div className="auth-art-book"><BookOpen size={54} strokeWidth={1.4} /></div>
+        <p>One thoughtful session<br />at a time.</p>
+      </aside>
+    </main>
+  )
+}
+
 function PageHeading({ eyebrow, title, description, action }) {
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>
 }
 
-function DashboardView({ dashboard, tasksExpanded, setTasksExpanded, showTaskForm, setShowTaskForm, taskDraft, setTaskDraft, addTask, toggleTask, navigate }) {
+function DashboardView({ dashboard, tasksExpanded, setTasksExpanded, showTaskForm, setShowTaskForm, taskDraft, setTaskDraft, addTask, toggleTask, navigate, studentName }) {
   const tasks = tasksExpanded ? dashboard.tasks : dashboard.tasks.slice(0, 4)
   const completed = dashboard.stats?.tasks_completed || 0
   const total = dashboard.stats?.tasks_total || 0
   return (
     <div className="page-content dashboard-page">
-      <PageHeading eyebrow="YOUR STUDY SPACE" title="Good morning, Alex" description="A little progress adds up. Here's your learning at a glance." action={<button className="primary-button" onClick={() => navigate('planner')}><Sparkles size={16} /> Plan my week</button>} />
+      <PageHeading eyebrow="YOUR STUDY SPACE" title={`Welcome, ${studentName.split(' ')[0]}.`} description="A little progress adds up. Here's your learning at a glance." action={<button className="primary-button" onClick={() => navigate('planner')}><Sparkles size={16} /> Plan my week</button>} />
       <section className="stats-grid" aria-label="Study statistics">
         <StatCard label="Subjects" value={dashboard.stats?.total_subjects || 0} note="Across your study list" icon={BookOpen} tone="blue" trend="In progress" />
         <StatCard label="Tasks completed" value={`${completed}/${total}`} note="Keep your momentum" icon={Check} tone="green" trend={`${total ? Math.round((completed / total) * 100) : 0}%`} />
         <StatCard label="Average score" value={`${dashboard.stats?.average_score || 0}%`} note="Across your recent quizzes" icon={Target} tone="coral" trend="Quiz results" />
         <StatCard label="Next exam" value={dashboard.exams?.[0] ? `${Math.max(0, Math.ceil((new Date(`${dashboard.exams[0].exam_date}T12:00:00`) - new Date()) / 86400000))} days` : '—'} note={dashboard.exams?.[0]?.course || 'Nothing scheduled'} icon={Clock3} tone="gold" trend="View calendar" />
+        <StatCard label="Quizzes completed" value={dashboard.stats?.quizzes_completed || 0} note="Saved quiz results" icon={CircleHelp} tone="green" trend="Keep practicing" />
+        <StatCard label="Study materials" value={dashboard.stats?.total_materials || 0} note="In your private library" icon={FileText} tone="gold" trend="Your resources" />
       </section>
 
       <div className="dashboard-grid">
@@ -383,6 +632,14 @@ function DashboardView({ dashboard, tasksExpanded, setTasksExpanded, showTaskFor
           <div className="focus-orbit orbit-one" /><div className="focus-orbit orbit-two" />
           <div className="focus-card-copy"><span className="focus-icon"><Lightbulb size={18} /></span><div className="focus-kicker">A GOOD PLACE TO START</div><h2>Make it make sense.</h2><p>Bring one tricky concept to your AI tutor and work through it, step by step.</p><button className="focus-button" onClick={() => navigate('tutor')}>Ask a question <ArrowUpRight size={15} /></button></div>
           <div className="focus-illustration"><div className="focus-book"><BookOpen size={39} strokeWidth={1.4} /></div><div className="focus-spark spark-a">✳</div><div className="focus-spark spark-b">✦</div><div className="focus-spark spark-c">·</div></div>
+        </section>
+        <section className="panel recent-panel">
+          <div className="panel-heading"><div><div className="eyebrow">YOUR AI TUTOR</div><h2>Recent conversations</h2></div></div>
+          {dashboard.recent_conversations?.length ? <div className="recent-list">{dashboard.recent_conversations.slice(0, 4).map((chat) => <article className="recent-item" key={chat.id}><strong>{chat.user_message}</strong><span>{formatDate(chat.created_at.slice(0, 10))} · {chat.ai_response.slice(0, 110)}{chat.ai_response.length > 110 ? '…' : ''}</span></article>)}</div> : <p className="recent-empty">Your saved tutor conversations will appear here.</p>}
+        </section>
+        <section className="panel recent-panel">
+          <div className="panel-heading"><div><div className="eyebrow">RECENT ACTIVITY</div><h2>Your learning progress</h2></div></div>
+          {dashboard.study_activity?.length ? <div className="recent-list">{dashboard.study_activity.slice(0, 5).map((item) => <article className="activity-item" key={item.id}><span className="activity-dot" /><div><strong>{item.activity}</strong><small>{formatDate(item.created_at.slice(0, 10))}</small></div></article>)}</div> : <p className="recent-empty">Your study activities and progress will appear here.</p>}
         </section>
       </div>
     </div>
@@ -422,7 +679,7 @@ function LibraryView({ busy, materials, onDelete, summary, summaryView, setSumma
 
   return <div className="page-content feature-page"><PageHeading eyebrow="YOUR STUDY MATERIALS" title="Make more of your notes." description="Drop in a lecture PDF and get a clear, review-ready summary." />
     <div className="library-layout"><label className={`upload-zone ${busy ? 'uploading' : ''}`}><input type="file" accept="application/pdf,.pdf" onChange={onUpload} disabled={busy} /><span className="upload-icon">{busy ? <LoaderCircle size={25} className="spin" /> : <Upload size={24} />}</span><strong>{busy ? 'Reading your document…' : 'Choose a PDF to summarize'}</strong><span>{busy ? 'Extracting text and organizing key ideas' : 'Select a file from your device · PDF up to 50 MB'}</span><span className="upload-browse">Browse files</span></label>
-      <div className="library-side"><div className="library-stat"><div className="library-stat-icon"><FileText size={18} /></div><div><strong>Study library</strong><span>Uploaded notes are available for quizzes</span></div></div><div className="library-tip"><div className="eyebrow">HOW IT WORKS</div><p>Text is extracted from your PDF, then organized into a quick overview and the most useful ideas to revisit.</p><div className="privacy-line"><Check size={14} /> Materials stay in your local SQLite database</div></div></div>
+      <div className="library-side"><div className="library-stat"><div className="library-stat-icon"><FileText size={18} /></div><div><strong>Study library</strong><span>Uploaded notes are available for quizzes</span></div></div><div className="library-tip"><div className="eyebrow">HOW IT WORKS</div><p>Text is extracted from your PDF, then organized into a quick overview and the most useful ideas to revisit.</p><div className="privacy-line"><Check size={14} /> Materials are scoped to your account</div></div></div>
     </div>
     <section className="material-library panel">
       <div className="panel-heading"><div><div className="eyebrow">SAVED MATERIALS</div><h2>Your library</h2></div><span className="plan-badge">{materials.length} {materials.length === 1 ? 'FILE' : 'FILES'}</span></div>
